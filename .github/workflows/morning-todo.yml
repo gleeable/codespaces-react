@@ -1,0 +1,28 @@
+name: 📋 Morning TO-DO Notification
+
+on:
+  schedule:
+    - cron: '40 23 * * *'  # 매일 오전 8:40 KST (UTC 23:40)
+  workflow_dispatch:         # 수동 테스트용
+
+jobs:
+  morning-todo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 패키지 설치
+        run: npm ci
+
+      - name: 할 일 알림 실행
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+        run: node scripts/notion-kakao.js
