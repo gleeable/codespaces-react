@@ -5,15 +5,14 @@ import { Client } from '@notionhq/client';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// 로컬 실행 시 src/.env 로드
 if (!process.env.NOTION_API_KEY) {
   dotenv.config({ path: resolve(__dirname, '../src/.env') });
 }
 
 const PAGE_ID = '30bb8f52b84f80999186e42ccce1968f';
+const NOTION_PAGE_URL = `https://www.notion.so/${PAGE_ID}`;
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
 
-// 카카오 액세스 토큰 갱신 (매일 만료되므로 refresh_token으로 갱신)
 async function refreshKakaoToken() {
   const res = await fetch('https://kauth.kakao.com/oauth/token', {
     method: 'POST',
@@ -31,39 +30,92 @@ async function refreshKakaoToken() {
   return data.access_token;
 }
 
-// 카카오 나에게 메시지 전송
-async function sendKakaoMessage(text, accessToken) {
+async function sendKakao(templateObject, accessToken) {
   const res = await fetch('https://kapi.kakao.com/v2/api/talk/memo/default/send', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/x-www-form-urlencoded',
     },
-    body: new URLSearchParams({
-      template_object: JSON.stringify({
-        object_type: 'text',
-        text: text.slice(0, 9000),
-        link: {
-          web_url: `https://www.notion.so/${PAGE_ID}`,
-          mobile_web_url: `https://www.notion.so/${PAGE_ID}`,
-        },
-      }),
-    }),
+    body: new URLSearchParams({ template_object: JSON.stringify(templateObject) }),
   });
   const result = await res.json();
-  if (result.result_code !== 0) {
-    throw new Error(`카카오 전송 실패: ${JSON.stringify(result)}`);
-  }
+  if (result.result_code !== 0) throw new Error(`카카오 전송 실패: ${JSON.stringify(result)}`);
   console.log('카카오톡 전송 완료');
 }
 
-// Notion 페이지 블록 가져오기
+// 리스트 템플릿: 항목마다 탭하면 완료 처리 (VERCEL_URL 필요)
+async function sendListTemplate(unchecked, checked, today, accessToken) {
+  const vercelUrl = process.env.VERCEL_URL;
+  const chunks = [];
+
+  // 5개씩 나눠 전송 (카카오 list 템플릿 최대 5개)
+  for (let i = 0; i < unchecked.length; i += 5) {
+    chunks.push(unchecked.slice(i, i + 5));
+  }
+
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const chunk = chunks[ci];
+    const headerTitle = ci === 0
+      ? `📋 TO-DO LIST — ${today}`
+      : `📋 TO-DO LIST (계속) — ${ci + 1}/${chunks.length}`;
+
+    const items = chunk.map(block => {
+      const text = block.to_do.rich_text.map(t => t.plain_text).join('');
+      const completeUrl = `${vercelUrl}/api/complete?blockId=${block.id}`;
+      return {
+        title: `☐  ${text}`,
+        description: '탭하면 완료 처리',
+        link: { web_url: completeUrl, mobile_web_url: completeUrl },
+      };
+    });
+
+    const template = {
+      object_type: 'list',
+      header_title: headerTitle,
+      header_link: { web_url: NOTION_PAGE_URL, mobile_web_url: NOTION_PAGE_URL },
+      items,
+      buttons: [
+        {
+          title: `✅ ${checked.length}완료  ☐ ${unchecked.length}남음`,
+          link: { web_url: NOTION_PAGE_URL, mobile_web_url: NOTION_PAGE_URL },
+        },
+      ],
+    };
+
+    await sendKakao(template, accessToken);
+    if (ci < chunks.length - 1) await new Promise(r => setTimeout(r, 500));
+  }
+}
+
+// 텍스트 템플릿: 간격 추가된 기본 메시지
+async function sendTextTemplate(unchecked, checked, today, accessToken) {
+  let message = `📋 TO-DO LIST — ${today}\n${'─'.repeat(24)}\n\n`;
+
+  if (unchecked.length === 0) {
+    message += '🎉 오늘 할 일을 모두 완료했어요!\n';
+  } else {
+    unchecked.forEach((block, i) => {
+      const text = block.to_do.rich_text.map(t => t.plain_text).join('');
+      message += `${i + 1}. ☐  ${text}\n\n`;
+    });
+  }
+
+  message += `${'─'.repeat(24)}\n`;
+  message += `✅ ${checked.length}개 완료  ·  ☐ ${unchecked.length}개 남음`;
+
+  await sendKakao({
+    object_type: 'text',
+    text: message.slice(0, 9000),
+    link: { web_url: NOTION_PAGE_URL, mobile_web_url: NOTION_PAGE_URL },
+  }, accessToken);
+}
+
 async function getPageBlocks() {
   const res = await notion.blocks.children.list({ block_id: PAGE_ID, page_size: 100 });
   return res.results;
 }
 
-// 미완료(unchecked) 항목을 맨 아래로 정렬
 async function sortUncheckedToBottom(blocks) {
   const todos = blocks.filter(b => b.type === 'to_do');
   const unchecked = todos.filter(b => !b.to_do.checked);
@@ -73,7 +125,6 @@ async function sortUncheckedToBottom(blocks) {
     return;
   }
 
-  // 이미 정렬됐는지 확인 (마지막 checked 인덱스 < 첫 unchecked 인덱스)
   const checkedIndices = todos.map((b, i) => b.to_do.checked ? i : -1).filter(i => i >= 0);
   const uncheckedIndices = todos.map((b, i) => !b.to_do.checked ? i : -1).filter(i => i >= 0);
   const lastChecked = Math.max(...checkedIndices, -1);
@@ -87,11 +138,10 @@ async function sortUncheckedToBottom(blocks) {
   console.log(`미완료 항목 ${unchecked.length}개 아래로 이동 중...`);
 
   for (const block of unchecked) {
-    const richText = block.to_do.rich_text;
     await notion.blocks.delete({ block_id: block.id });
     await notion.blocks.children.append({
       block_id: PAGE_ID,
-      children: [{ type: 'to_do', to_do: { rich_text: richText, checked: false } }],
+      children: [{ type: 'to_do', to_do: { rich_text: block.to_do.rich_text, checked: false } }],
     });
   }
 
@@ -113,21 +163,16 @@ async function main() {
     timeZone: 'Asia/Seoul',
   });
 
-  let message = `📋 TO-DO LIST — ${today}\n${'─'.repeat(24)}\n`;
+  const vercelUrl = process.env.VERCEL_URL;
 
-  if (unchecked.length === 0) {
-    message += '🎉 오늘 할 일을 모두 완료했어요!\n';
+  if (vercelUrl && unchecked.length >= 2) {
+    // Vercel 배포 후: 리스트 템플릿 (탭 → 완료 처리)
+    await sendListTemplate(unchecked, checked, today, accessToken);
   } else {
-    for (const block of unchecked) {
-      const text = block.to_do.rich_text.map(t => t.plain_text).join('');
-      message += `☐  ${text}\n`;
-    }
+    // Vercel 미배포 or 항목 1개 이하: 간격 있는 텍스트 템플릿
+    await sendTextTemplate(unchecked, checked, today, accessToken);
   }
 
-  message += `${'─'.repeat(24)}\n`;
-  message += `✅ ${checked.length}개 완료  ·  ☐ ${unchecked.length}개 남음`;
-
-  await sendKakaoMessage(message, accessToken);
   await sortUncheckedToBottom(blocks);
 
   console.log('== 완료 ==');
